@@ -232,7 +232,7 @@ update_history() {
   mv "${histfile}.new" "$histfile"
 }
 
-# MODIFIED: Print URL instead of playing
+# MODIFIED: Print URL and write to file
 print_episode_url() {
   [ -z "$episode" ] && get_episode_url
   printf "\033[1;34mTitle:\033[0m %s\n" "$title"
@@ -241,29 +241,39 @@ print_episode_url() {
   printf "\033[1;34mURL:\033[0m %s\n" "$episode"
   [ -n "$subtitle" ] && printf "\033[1;34mSubtitle:\033[0m %s\n" "$subtitle"
   [ -n "$m3u8_refr" ] && printf "\033[1;34mReferer:\033[0m %s\n" "$m3u8_refr"
+  
+  # Write URL to file if in print_url_mode
+  if [ "$print_url_mode" = "1" ] && [ -n "$output_file" ]; then
+    printf "%s\n" "$episode" >> "$output_file"
+  fi
+  
   unset episode
   update_history
 }
 
 print_url() {
-  start=$(printf "%s" "$ep_no" | grep -Eo '^(-1|[0-9]+(\.[0-9]+)?)')
-  end=$(printf "%s" "$ep_no" | grep -Eo '(-1|[0-9]+(\.[0-9]+)?)$')
-  [ "$start" = "-1" ] && ep_no=$(printf "%s" "$ep_list" | tail -n1) && unset start
-  [ -z "$end" ] || [ "$end" = "$start" ] && unset start end
-  [ "$end" = "-1" ] && end=$(printf "%s" "$ep_list" | tail -n1)
-  line_count=$(printf "%s\n" "$ep_no" | wc -l | tr -d "[:space:]")
-  if [ "$line_count" != 1 ] || [ -n "$start" ]; then
-    [ -z "$start" ] && start=$(printf "%s\n" "$ep_no" | head -n1)
-    [ -z "$end" ] && end=$(printf "%s\n" "$ep_no" | tail -n1)
-    range=$(printf "%s\n" "$ep_list" | sed -nE "/^${start}\$/,/^${end}\$/p")
-    [ -z "$range" ] && die "Invalid range!"
-    for i in $range; do
+  # MODIFIED: Create output file based on anime title
+  if [ "$print_url_mode" = "1" ]; then
+    # Sanitize title for filename (remove special chars, replace spaces with underscores)
+    safe_title=$(printf "%s" "$title" | sed 's/([^)]*)//g' | sed 's/[^a-zA-Z0-9 ]//g' | sed 's/^ *//;s/ *$//' | tr ' ' '_')
+    output_file="${safe_title}.txt"
+    # Clear file if it exists
+    : > "$output_file"
+    printf "\033[1;32mWriting URLs to: %s\033[0m\n\n" "$output_file"
+  fi
+  
+  # MODIFIED: If no episode specified with -e flag, get all episodes
+  if [ -z "$ep_no" ]; then
+    printf "\033[1;33mNo episode specified, fetching URLs for all episodes...\033[0m\n\n"
+    for i in $ep_list; do
       ep_no=$i
       printf "\n"
       print_episode_url
     done
   else
-    print_episode_url
+    # Original logic for when episode is specified
+    start=$(printf "%s" "$ep_no" | grep -Eo '^(-1|[0-9]+(\.[0-9]+)?)')
+    end=$(printf "%s" "$ep_no" | grep -Eo '(-1|[0-9]+(\.[0-9]+)?)')
   fi
 }
 
@@ -344,7 +354,12 @@ history)
   [ -z "$id" ] && exit 1
   title=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed 's/ - episode.*//')
   ep_list=$(episodes_list "$id")
-  ep_no=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed -nE 's/.*- episode (.+)$/\1/p')
+  # MODIFIED: Don't prompt for episode in history mode when using -u flag
+  if [ "$print_url_mode" = "1" ]; then
+    ep_no=""
+  else
+    ep_no=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed -nE 's/.*- episode (.+)$/\1/p')
+  fi
   ;;
 *)
   if [ "$use_external_menu" = "0" ]; then
@@ -366,8 +381,152 @@ history)
   title=$(printf "%s" "$result" | cut -f2)
   id=$(printf "%s" "$result" | cut -f1)
   ep_list=$(episodes_list "$id")
-  [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag")
-  [ -z "$ep_no" ] && exit 1
+  # MODIFIED: Don't prompt for episode when using -u flag without -e
+  if [ "$print_url_mode" = "0" ] && [ -z "$ep_no" ]; then
+    ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag")
+    [ -z "$ep_no" ] && exit 1
+  fi
+  ;;
+esac
+
+# Print URL instead of playing
+print_url
+exit 0
+)
+    [ "$start" = "-1" ] && ep_no=$(printf "%s" "$ep_list" | tail -n1) && unset start
+    [ -z "$end" ] || [ "$end" = "$start" ] && unset start end
+    [ "$end" = "-1" ] && end=$(printf "%s" "$ep_list" | tail -n1)
+    line_count=$(printf "%s\n" "$ep_no" | wc -l | tr -d "[:space:]")
+    if [ "$line_count" != 1 ] || [ -n "$start" ]; then
+      [ -z "$start" ] && start=$(printf "%s\n" "$ep_no" | head -n1)
+      [ -z "$end" ] && end=$(printf "%s\n" "$ep_no" | tail -n1)
+      range=$(printf "%s\n" "$ep_list" | sed -nE "/^${start}\$/,/^${end}\$/p")
+      [ -z "$range" ] && die "Invalid range!"
+      for i in $range; do
+        ep_no=$i
+        printf "\n"
+        print_episode_url
+      done
+    else
+      print_episode_url
+    fi
+  fi
+  
+  # MODIFIED: Print success message after writing file
+  if [ "$print_url_mode" = "1" ] && [ -n "$output_file" ]; then
+    printf "\n\033[1;32mSuccessfully wrote URLs to: %s\033[0m\n" "$output_file"
+  fi
+}
+
+# MAIN
+
+agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
+allanime_refr="https://allmanga.to"
+allanime_base="allanime.day"
+allanime_api="https://api.${allanime_base}"
+mode="${ANI_CLI_MODE:-sub}"
+quality="${ANI_CLI_QUALITY:-best}"
+use_external_menu="${ANI_CLI_EXTERNAL_MENU:-0}"
+external_menu_normal_window="${ANI_CLI_EXTERNAL_MENU_NORMAL_WINDOW:-0}"
+[ -t 0 ] || use_external_menu=1
+hist_dir="${ANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli}"
+[ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
+histfile="$hist_dir/ani-hsts"
+[ ! -f "$histfile" ] && : >"$histfile"
+search="${ANI_CLI_DEFAULT_SOURCE:-scrape}"
+print_url_mode=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+  -q | --quality)
+    [ $# -lt 2 ] && die "missing argument!"
+    quality="$2"
+    shift
+    ;;
+  -S | --select-nth)
+    [ $# -lt 2 ] && die "missing argument!"
+    index="$2"
+    shift
+    ;;
+  -c | --continue) search=history ;;
+  -u | --url) print_url_mode=1 ;;
+  -D | --delete)
+    : >"$histfile"
+    exit 0
+    ;;
+  -l | --logview)
+    case "$(uname -s)" in
+    Darwin*) log show --predicate 'process == "logger"' ;;
+    Linux*) journalctl -t ani-cli ;;
+    *) die "Logger not implemented for your platform" ;;
+    esac
+    exit 0
+    ;;
+  -V | --version) version_info ;;
+  -h | --help) help_info ;;
+  -e | --episode | -r | --range)
+    [ $# -lt 2 ] && die "missing argument!"
+    ep_no="$2"
+    shift
+    ;;
+  --dub) mode="dub" ;;
+  --rofi) use_external_menu=1 ;;
+  -N | --nextep-countdown) search=nextep ;;
+  -U | --update) update_script ;;
+  *) query="$(printf "%s" "$query $1" | sed "s|^ ||;s| |+|g")" ;;
+  esac
+  shift
+done
+[ "$use_external_menu" = "0" ] && multi_selection_flag="${ANI_CLI_MULTI_SELECTION:-"-m"}"
+[ "$use_external_menu" = "1" ] && multi_selection_flag="${ANI_CLI_MULTI_SELECTION:-"-multi-select"}"
+[ "$external_menu_normal_window" = "1" ] && external_menu_args="-normal-window"
+printf "\33[2K\r\033[1;34mChecking dependencies...\033[0m\n"
+dep_ch "curl" "sed" "grep" || true
+dep_ch "fzf" || true
+
+# searching
+case "$search" in
+history)
+  anime_list=$(while read -r ep_no id title; do process_hist_entry & done <"$histfile")
+  wait
+  [ -z "$anime_list" ] && die "No unwatched series in history!"
+  [ -z "${index##*[!0-9]*}" ] && id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f1)
+  [ -z "${index##*[!0-9]*}" ] || id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f1)
+  [ -z "$id" ] && exit 1
+  title=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed 's/ - episode.*//')
+  ep_list=$(episodes_list "$id")
+  # MODIFIED: Don't prompt for episode in history mode when using -u flag
+  if [ "$print_url_mode" = "1" ]; then
+    ep_no=""
+  else
+    ep_no=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed -nE 's/.*- episode (.+)$/\1/p')
+  fi
+  ;;
+*)
+  if [ "$use_external_menu" = "0" ]; then
+    while [ -z "$query" ]; do
+      printf "\33[2K\r\033[1;36mSearch anime: \033[0m" && read -r query
+    done
+  else
+    [ -z "$query" ] && query=$(printf "" | external_menu "" "Search anime: " "$external_menu_args")
+    [ -z "$query" ] && exit 1
+  fi
+  [ "$search" = "nextep" ] && time_until_next_ep "$query"
+
+  query=$(printf "%s" "$query" | sed "s| |+|g")
+  anime_list=$(search_anime "$query")
+  [ -z "$anime_list" ] && die "No results found!"
+  [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
+  [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
+  [ -z "$result" ] && exit 1
+  title=$(printf "%s" "$result" | cut -f2)
+  id=$(printf "%s" "$result" | cut -f1)
+  ep_list=$(episodes_list "$id")
+  # MODIFIED: Don't prompt for episode when using -u flag without -e
+  if [ "$print_url_mode" = "0" ] && [ -z "$ep_no" ]; then
+    ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag")
+    [ -z "$ep_no" ] && exit 1
+  fi
   ;;
 esac
 
