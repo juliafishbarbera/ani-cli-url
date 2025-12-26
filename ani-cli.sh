@@ -1,5 +1,40 @@
 #!/bin/sh
 
+# argument parsing for download flag~
+download_mode=false
+season_number="01" # default to season 1
+for arg in "$@"; do
+  case $arg in
+  -h | --help)
+    printf "\033[1;36mani-cli-url - Anime CLI URL Fetcher\033[0m\n\n"
+    printf "\033[1;33mUsage:\033[0m\n"
+    printf "  ani-cli.sh [OPTIONS]\n\n"
+    printf "\033[1;33mOptions:\033[0m\n"
+    printf "  -d, --download    Download episodes using aria2c instead of saving URLs\n"
+    printf "  -s, --season N    Specify season number (default: 01)\n"
+    printf "  -h, --help        Show this help message\n\n"
+    printf "\033[1;33mExamples:\033[0m\n"
+    printf "  ani-cli.sh                           # Save URLs to file\n"
+    printf "  ani-cli.sh -d                        # Download episodes (Season 01)\n"
+    printf "  ani-cli.sh -d -s 2                   # Download episodes (Season 02)\n"
+    printf "  ani-cli.sh --download --season 3     # Download episodes (Season 03)\n"
+    exit 0
+    ;;
+  -d | --download)
+    download_mode=true
+    shift
+    ;;
+  -s | --season)
+    shift
+    season_number=$(printf "%02d" "${1:-1}")
+    shift
+    ;;
+  *)
+    # ignore other args for now~
+    ;;
+  esac
+done
+
 die() {
   printf "\33[2K\r\033[1;31m%s\033[0m\n" "$*" >&2
   exit 1
@@ -89,6 +124,71 @@ episodes_list() {
 |g; s|"||g' | sort -n -k 1
 }
 
+# DOWNLOAD FUNCTIONS - ~
+
+create_download_dir() {
+  title="$1"
+  season="$2"
+
+  series_name=$(printf "%s" "$title" | sed 's/\b\([a-z]\)/\u\1/g' | sed 's/[^a-zA-Z0-9 ]//g' | sed 's/  */ /g' | sed 's/^ *//;s/ *$//')
+
+  season_dir="Season ${season}"
+  download_dir="${series_name}/${season_dir}"
+
+  [ ! -d "$download_dir" ] && mkdir -p "$download_dir"
+  printf "%s" "$download_dir"
+}
+
+detect_format() {
+  url="$1"
+  case "$url" in
+  *.mp4*) printf "mp4" ;;
+  *.mkv*) printf "mkv" ;;
+  *.avi*) printf "avi" ;;
+  *.webm*) printf "webm" ;;
+  *)
+    content_type=$(curl -s -I "$url" | grep -i "content-type" | cut -d':' -f2 | tr -d ' \r\n')
+    case "$content_type" in
+    *video/mp4*) printf "mp4" ;;
+    *video/x-matroska*) printf "mkv" ;;
+    *video/avi*) printf "avi" ;;
+    *video/webm*) printf "webm" ;;
+    *) printf "mp4" ;;
+    esac
+    ;;
+  esac
+}
+
+download_episode() {
+  ep_no="$1"
+  url="$2"
+  title="$3"
+  season="$4"
+
+  download_dir=$(create_download_dir "$title" "$season")
+
+  format=$(detect_format "$url")
+
+  series_name=$(printf "%s" "$title" | sed 's/\b\([a-z]\)/\u\1/g' | sed 's/[^a-zA-Z0-9 ]//g' | sed 's/  */ /g' | sed 's/^ *//;s/ *$//')
+  ep_padded=$(printf "%02d" "$ep_no")
+  filename="${series_name} S${season}E${ep_padded}.${format}"
+  filepath="${download_dir}/${filename}"
+
+  printf "\033[1;33mDownloading episode %s to %s...\033[0m\n" "$ep_no" "$filepath"
+  aria2c -x 16 -s 16 --continue=true --file-allocation=none --max-connection-per-server=16 \
+    --user-agent="$agent" \
+    --referer="$allanime_refr" \
+    -o "$filename" \
+    -d "$download_dir" \
+    "$url"
+
+  if [ $? -eq 0 ]; then
+    printf "\033[1;32m✓ Successfully downloaded episode %s\033[0m\n" "$ep_no"
+  else
+    printf "\033[1;31m✗ Failed to download episode %s\033[0m\n" "$ep_no"
+  fi
+}
+
 # MAIN
 
 agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
@@ -97,7 +197,11 @@ allanime_base="allanime.day"
 allanime_api="https://api.${allanime_base}"
 
 printf "\033[1;34mChecking dependencies...\033[0m\n"
-dep_ch "curl" "sed" "grep" "fzf"
+if [ "$download_mode" = true ]; then
+  dep_ch "curl" "sed" "grep" "fzf" "aria2c"
+else
+  dep_ch "curl" "sed" "grep" "fzf"
+fi
 
 # Get search query
 while [ -z "$query" ]; do
@@ -112,25 +216,43 @@ anime_list=$(search_anime "$query")
 result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | fzf --reverse --cycle --prompt "Select anime: ")
 [ -z "$result" ] && exit 1
 
-title=$(printf "%s" "$result" | cut -f3)
+title=$(printf "%s" "$result" | cut -f3 | sed 's/ ([0-9]* episodes)$//')
 id=$(printf "%s" "$result" | cut -f2)
 ep_list=$(episodes_list "$id")
 
-# Create output file
-safe_title=$(printf "%s" "$title" | sed 's/([^)]*)//g' | sed 's/[^a-zA-Z0-9 ]//g' | sed 's/^ *//;s/ *$//' | tr ' ' '_')
-output_file="${safe_title}.txt"
-: >"$output_file"
+if [ "$download_mode" = true ]; then
+  download_dir=$(create_download_dir "$title")
+  printf "\033[1;32mDownloading episodes to directory: %s\033[0m\n\n" "$download_dir"
 
-printf "\033[1;32mFetching URLs for all episodes...\033[0m\n"
-printf "\033[1;32mWriting to: %s\033[0m\n\n" "$output_file"
+  for ep_no in $ep_list; do
+    printf "Fetching episode %s...\n" "$ep_no"
+    get_episode_url
+    if [ -n "$episode" ]; then
+      download_episode "$ep_no" "$episode" "$title" "$season_number"
+    else
+      printf "\033[1;31m✗ Failed to get URL for episode %s\033[0m\n" "$ep_no"
+    fi
+    unset episode
+  done
 
-# Get all episode URLs
-for ep_no in $ep_list; do
-  printf "Fetching episode %s...\n" "$ep_no"
-  get_episode_url
-  printf "%s\n" "$episode" >>"$output_file"
-  unset episode
-done
+  printf "\n\033[1;32mDone! Episodes downloaded to: %s\033[0m\n" "$download_dir"
+else
+  safe_title=$(printf "%s" "$title" | sed 's/([^)]*)//g' | sed 's/[^a-zA-Z0-9 ]//g' | sed 's/^ *//;s/ *$//' | tr ' ' '_')
+  output_file="${safe_title}.txt"
+  : >"$output_file"
 
-printf "\n\033[1;32mDone! URLs saved to: %s\033[0m\n" "$output_file"
+  printf "\033[1;32mFetching URLs for all episodes...\033[0m\n"
+  printf "\033[1;32mWriting to: %s\033[0m\n\n" "$output_file"
+
+  # Get all episode URLs
+  for ep_no in $ep_list; do
+    printf "Fetching episode %s...\n" "$ep_no"
+    get_episode_url
+    printf "%s\n" "$episode" >>"$output_file"
+    unset episode
+  done
+
+  printf "\n\033[1;32mDone! URLs saved to: %s\033[0m\n" "$output_file"
+fi
+
 exit 0
