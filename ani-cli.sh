@@ -3,6 +3,8 @@
 # argument parsing for download flag~
 download_mode=false
 season_number="01" # default to season 1
+max_retries=3
+retry_delay=5
 for arg in "$@"; do
   case $arg in
   -h | --help)
@@ -12,11 +14,14 @@ for arg in "$@"; do
     printf "\033[1;33mOptions:\033[0m\n"
     printf "  -d, --download    Download episodes using aria2c instead of saving URLs\n"
     printf "  -s, --season N    Specify season number (default: 01)\n"
+    printf "  -r, --retries N   Max retry attempts for failed downloads (default: 3)\n"
+    printf "  -t, --delay N     Delay between retries in seconds (default: 5)\n"
     printf "  -h, --help        Show this help message\n\n"
     printf "\033[1;33mExamples:\033[0m\n"
     printf "  ani-cli.sh                           # Save URLs to file\n"
     printf "  ani-cli.sh -d                        # Download episodes (Season 01)\n"
     printf "  ani-cli.sh -d -s 2                   # Download episodes (Season 02)\n"
+    printf "  ani-cli.sh -d -r 5 -t 10             # Download with 5 retries, 10s delay\n"
     printf "  ani-cli.sh --download --season 3     # Download episodes (Season 03)\n"
     exit 0
     ;;
@@ -27,6 +32,16 @@ for arg in "$@"; do
   -s | --season)
     shift
     season_number=$(printf "%02d" "${1:-1}")
+    shift
+    ;;
+  -r | --retries)
+    shift
+    max_retries="${1:-3}"
+    shift
+    ;;
+  -t | --delay)
+    shift
+    retry_delay="${1:-5}"
     shift
     ;;
   *)
@@ -124,7 +139,7 @@ episodes_list() {
 |g; s|"||g' | sort -n -k 1
 }
 
-# DOWNLOAD FUNCTIONS - ~
+# PARALLEL FETCH AND DOWNLOAD FUNCTIONS - ~
 
 create_download_dir() {
   title="$1"
@@ -159,11 +174,71 @@ detect_format() {
   esac
 }
 
+fetch_all_episode_urls() {
+  title="$1"
+  id="$2"
+  ep_list="$3"
+  
+  temp_urls_file=$(mktemp)
+  printf "\033[1;32mFetching URLs for all episodes...\033[0m\n" >&2
+  
+  for ep_no in $ep_list; do
+    {
+      printf "Fetching episode %s...\n" "$ep_no" >&2
+      get_episode_url
+      if [ -n "$episode" ]; then
+        printf "%s|%s\n" "$ep_no" "$episode" >>"$temp_urls_file"
+      else
+        printf "\033[1;31m✗ Failed to get URL for episode %s\033[0m\n" "$ep_no" >&2
+      fi
+      unset episode
+    } &
+  done
+  wait
+  
+  printf "%s" "$temp_urls_file"
+}
+
+download_episodes_parallel() {
+  title="$1"
+  season="$2"
+  urls_file="$3"
+  max_jobs="${4:-4}"
+  
+  download_dir=$(create_download_dir "$title" "$season")
+  failed_episodes_file=$(mktemp)
+  printf "\033[1;32mDownloading episodes to directory: %s\033[0m\n" "$download_dir"
+  
+  job_count=0
+  while IFS='|' read -r ep_no url; do
+    while [ $job_count -ge $max_jobs ]; do
+      wait -n 2>/dev/null || true
+      job_count=$(jobs -r | wc -l)
+    done
+    
+    {
+      download_episode "$ep_no" "$url" "$title" "$season" "$failed_episodes_file"
+    } &
+    job_count=$((job_count + 1))
+  done < "$urls_file"
+  
+  wait
+  
+  if [ -s "$failed_episodes_file" ]; then
+    printf "\n\033[1;31mThe following episodes failed to download:\033[0m\n"
+    cat "$failed_episodes_file"
+    rm -f "$failed_episodes_file"
+  fi
+  
+  printf "\n\033[1;32mDone! Episodes downloaded to: %s\033[0m\n" "$download_dir"
+}
+
 download_episode() {
   ep_no="$1"
   url="$2"
   title="$3"
   season="$4"
+  failed_episodes_file="$5"
 
   download_dir=$(create_download_dir "$title" "$season")
 
@@ -174,18 +249,37 @@ download_episode() {
   filename="${series_name} S${season}E${ep_padded}.${format}"
   filepath="${download_dir}/${filename}"
 
-  printf "\033[1;33mDownloading episode %s to %s...\033[0m\n" "$ep_no" "$filepath"
-  aria2c -x 16 -s 16 --continue=true --file-allocation=none --max-connection-per-server=16 \
-    --user-agent="$agent" \
-    --referer="$allanime_refr" \
-    -o "$filename" \
-    -d "$download_dir" \
-    "$url"
+  retry_count=0
+  download_success=false
 
-  if [ $? -eq 0 ]; then
-    printf "\033[1;32m✓ Successfully downloaded episode %s\033[0m\n" "$ep_no"
-  else
-    printf "\033[1;31m✗ Failed to download episode %s\033[0m\n" "$ep_no"
+  while [ $retry_count -lt $max_retries ] && [ "$download_success" = false ]; do
+    if [ $retry_count -gt 0 ]; then
+      printf "\033[1;33mRetrying episode %s (attempt %d/%d) in %d seconds...\033[0m\n" "$ep_no" "$((retry_count + 1))" "$max_retries" "$retry_delay"
+      sleep "$retry_delay"
+    fi
+
+    printf "\033[1;33mDownloading episode %s to %s...\033[0m\n" "$ep_no" "$filepath"
+    aria2c -x 16 -s 16 --continue=true --file-allocation=none --max-connection-per-server=16 \
+      --user-agent="$agent" \
+      --referer="$allanime_refr" \
+      -o "$filename" \
+      -d "$download_dir" \
+      "$url" 2>/dev/null
+
+    if [ $? -eq 0 ]; then
+      printf "\033[1;32m✓ Successfully downloaded episode %s\033[0m\n" "$ep_no"
+      download_success=true
+    else
+      retry_count=$((retry_count + 1))
+      if [ $retry_count -lt $max_retries ]; then
+        printf "\033[1;31m✗ Failed to download episode %s (attempt %d/%d)\033[0m\n" "$ep_no" "$retry_count" "$max_retries"
+      fi
+    fi
+  done
+
+  if [ "$download_success" = false ]; then
+    printf "\033[1;31m✗ Failed to download episode %s after %d attempts\033[0m\n" "$ep_no" "$max_retries"
+    printf "%s\n" "$ep_no" >>"$failed_episodes_file"
   fi
 }
 
@@ -221,21 +315,15 @@ id=$(printf "%s" "$result" | cut -f2)
 ep_list=$(episodes_list "$id")
 
 if [ "$download_mode" = true ]; then
-  download_dir=$(create_download_dir "$title")
-  printf "\033[1;32mDownloading episodes to directory: %s\033[0m\n\n" "$download_dir"
-
-  for ep_no in $ep_list; do
-    printf "Fetching episode %s...\n" "$ep_no"
-    get_episode_url
-    if [ -n "$episode" ]; then
-      download_episode "$ep_no" "$episode" "$title" "$season_number"
-    else
-      printf "\033[1;31m✗ Failed to get URL for episode %s\033[0m\n" "$ep_no"
-    fi
-    unset episode
-  done
-
-  printf "\n\033[1;32mDone! Episodes downloaded to: %s\033[0m\n" "$download_dir"
+  urls_file=$(fetch_all_episode_urls "$title" "$id" "$ep_list")
+  
+  if [ -s "$urls_file" ]; then
+    download_episodes_parallel "$title" "$season_number" "$urls_file"
+  else
+    printf "\033[1;31mNo valid URLs found for any episodes\033[0m\n"
+  fi
+  
+  rm -f "$urls_file"
 else
   safe_title=$(printf "%s" "$title" | sed 's/([^)]*)//g' | sed 's/[^a-zA-Z0-9 ]//g' | sed 's/^ *//;s/ *$//' | tr ' ' '_')
   output_file="${safe_title}.txt"
